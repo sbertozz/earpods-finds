@@ -6,6 +6,9 @@
      node scripts/scan.mjs --dry           # stampa solo il riepilogo
      node scripts/scan.mjs --channels=a,b  # canali extra
      node scripts/scan.mjs --days=30       # finestra archivio
+     node scripts/scan.mjs --rebuild       # solo normalizzazione offline di data.json
+     node scripts/scan.mjs --workflow      # usato dal workflow: fa avanzare data.json
+                                           # anche quando ci sono poche offerte nuove
    Richiede Node 18+ (fetch nativo). Nessuna dipendenza npm.
    ─────────────────────────────────────────────────────────────── */
 import fs from "node:fs/promises";
@@ -17,6 +20,7 @@ import {
   extractOffers,
   mergeDeals,
   pruneDeals,
+  renormalizeDeals,
   computeStats,
   buildChannels,
 } from "../lib/tg.js";
@@ -30,6 +34,10 @@ const args = new Map(
 
 const DATA_FILE = path.resolve(process.env.DATA_FILE || "data.json");
 const DRY = args.has("dry");
+const REBUILD = args.has("rebuild");
+/** nel workflow settiamo --workflow: generatedAt avanza sempre, così il
+    "Run workflow" manuale produce comunque un commit verificabile */
+const WORKFLOW = args.has("workflow");
 const DAYS = Number(args.get("days") || process.env.ARCHIVE_DAYS || 30);
 const MAX_DEALS = Number(args.get("max") || 900);
 const UA = "Mozilla/5.0 (compatible; AuricolariRadar/1.0; +https://github.com/sbertozz/earpods-finds)";
@@ -60,9 +68,46 @@ async function readArchive() {
   }
 }
 
+/**
+ * Riscrive le offerte già salvate con il parser attuale: corregge store,
+ * marca, modello, categoria e specifiche, elimina le card fantasma e
+ * ricompatta i doppioni per modello. Non tocca la rete.
+ */
+function normalizeArchive(deals = []) {
+  const { deals: clean, dropped } = renormalizeDeals(deals);
+  if (dropped) console.log(`↻ ${dropped} card non valide rimosse (venditore/risparmio/non audio)`);
+  return clean;
+}
+
 async function main() {
   const prev = await readArchive();
-  const previousDeals = (prev.deals || []).filter((d) => d && d.key);
+  const previousDeals = normalizeArchive((prev.deals || []).filter((d) => d && d.key));
+
+  // --rebuild: rigenero data.json senza scaricare i canali (utile offline)
+  if (REBUILD) {
+    const nowIso = new Date().toISOString();
+    const channelMeta = { ...(prev.channels || []).reduce((acc, c) => ({ ...acc, [c.channel]: c }), {}) };
+    for (const s of prev.stats?.sources || []) if (s?.channel) channelMeta[s.channel] = { ...(channelMeta[s.channel] || {}), ...s };
+    const pruned = pruneDeals(previousDeals, { days: DAYS, max: MAX_DEALS });
+    const stats = computeStats(pruned, channelMeta, {
+      now: nowIso,
+      lastScanAt: prev.generatedAt || nowIso,
+      scans: prev.stats?.scanner?.scans || 0,
+      errors: 0,
+    });
+    const snapshot = {
+      generatedAt: nowIso,
+      mode: "static",
+      deals: pruned,
+      stats,
+      channels: buildChannels(pruned, channelMeta),
+    };
+    console.log(`↻ rebuild offline: ${pruned.length} offerte · modelli unici: ${stats.uniqueModels} · con ANC: ${stats.ancCount}`);
+    if (DRY) return console.log("(--dry: data.json non modificato)");
+    await fs.writeFile(DATA_FILE, JSON.stringify(snapshot, null, 0) + "\n", "utf8");
+    console.log(`✓ scritto ${path.relative(process.cwd(), DATA_FILE)}`);
+    return;
+  }
   const channelMeta = {};
   for (const s of prev.stats?.sources || prev.channels || []) {
     if (s?.channel) channelMeta[s.channel] = { ...(channelMeta[s.channel] || {}), ...s };
@@ -120,11 +165,19 @@ async function main() {
     deals: pruned,
     stats,
     channels: buildChannels(pruned, channelMeta),
+    scanner: {
+      lastScanAt: nowIso,
+      channelsOk: ok,
+      channelsTotal: channels.length,
+      newDeals: added.length,
+      workflow: true,
+    },
   };
 
   console.log(
     `\ncanali ok: ${ok}/${channels.length} · nuove offerte: ${added.length} · archivio: ${pruned.length} · sconto max: ${stats.bestDiscount}%`,
   );
+  if (WORKFLOW) console.log("(--workflow: data.json viene riscritto anche senza novità)");
 
   if (DRY) {
     console.log("(--dry: data.json non modificato)");

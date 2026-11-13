@@ -455,6 +455,122 @@ main { position: relative; z-index: 1; max-width: 1240px; margin: 0 auto; paddin
 }
 .also-on a:hover { color: var(--text); border-style: solid; }
 
+.also-on { align-items: center; }
+.also-on .seen-count {
+  font-size: 10.5px;
+  color: var(--muted-2);
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.14);
+  border: 1px solid rgba(124, 92, 255, 0.28);
+  white-space: nowrap;
+}
+
+/* ── riga "Pro e contro" (apre la scheda) ── */
+.card-cta-main {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 11px;
+  border: 1px solid var(--stroke-strong);
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.card-cta-main:hover { background: rgba(255, 255, 255, 0.1); }
+.card-cta-main .cta-chevron { font-size: 11px; color: var(--muted); transition: transform 0.2s; }
+.card.expanded .card-cta-main { border-color: rgba(34, 211, 238, 0.45); background: rgba(34, 211, 238, 0.1); }
+.card.expanded .card-cta-main .cta-chevron { transform: rotate(180deg); color: var(--accent-2); }
+
+/* ── scheda dettaglio pro/contro + specifiche ── */
+.card-detail {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 13px;
+  border: 1px solid var(--stroke);
+  background: rgba(8, 12, 22, 0.72);
+  animation: detail-in 0.18s ease-out;
+}
+.card-detail[hidden] { display: none; }
+@keyframes detail-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.pc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+@media (max-width: 430px) { .pc-grid { grid-template-columns: 1fr; } }
+.pc-col { display: grid; gap: 6px; align-content: start; }
+.pc-col h4 {
+  margin: 0;
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+  font-weight: 800;
+}
+.pc-col.pros h4 { color: #4ade80; }
+.pc-col.cons h4 { color: #fb7185; }
+.pc-col ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.pc-col li {
+  display: grid;
+  grid-template-columns: 15px 1fr;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text);
+}
+.pc-ico {
+  width: 15px; height: 15px;
+  border-radius: 5px;
+  display: grid; place-items: center;
+  font-size: 11px; font-weight: 800;
+  margin-top: 1px;
+}
+.pc-ico.pro { background: rgba(34, 197, 94, 0.16); color: #4ade80; }
+.pc-ico.con { background: rgba(251, 113, 133, 0.16); color: #fb7185; }
+
+.spec-table {
+  display: grid;
+  gap: 1px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--stroke);
+}
+.spec-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 40%) 1fr;
+  gap: 8px;
+  padding: 6px 9px;
+  background: rgba(13, 18, 31, 0.96);
+  font-size: 11px;
+}
+.spec-k { color: var(--muted-2); }
+.spec-v { color: var(--text); font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.spec-src {
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  background: rgba(34, 211, 238, 0.1);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-weight: 700;
+}
+.detail-note {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--muted-2);
+  border-left: 2px solid rgba(251, 191, 36, 0.45);
+  padding-left: 8px;
+}
+.detail-note.ok { border-left-color: rgba(34, 197, 94, 0.5); }
+
 .card-actions { display: flex; gap: 4px; }
 .icon-btn svg { width: 13px; height: 13px; }
 .icon-btn {

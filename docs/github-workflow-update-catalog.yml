@@ -1,16 +1,19 @@
 name: Aggiorna catalogo auricolari
 
 # Rigenera data.json leggendo l'anteprima pubblica dei canali Telegram.
-# Gira ogni 20 minuti, oppure a mano da Actions → "Run workflow".
+# Gira ogni 12 minuti (GitHub può ritardare di qualche minuto nei momenti di
+# punta), oppure a mano da Actions → "Run workflow".
+# Così il catalogo resta fresco ANCHE se tutti i proxy CORS del browser sono giù.
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/12 * * * *"
   workflow_dispatch:
   push:
     paths:
       - "scripts/scan.mjs"
       - "lib/tg.js"
+      - "lib/models.js"
       - ".github/workflows/update-catalog.yml"
 
 permissions:
@@ -34,11 +37,14 @@ jobs:
       - name: Test del motore di scansione
         run: node test/run.mjs
 
+      - name: Normalizza le offerte già in archivio
+        run: node scripts/scan.mjs --rebuild
+
       - name: Scansiona i canali Telegram
         env:
           TELEGRAM_CHANNELS: ${{ vars.TELEGRAM_CHANNELS }}
           ARCHIVE_DAYS: ${{ vars.ARCHIVE_DAYS }}
-        run: node scripts/scan.mjs
+        run: node scripts/scan.mjs --workflow
 
       - name: Commit di data.json
         run: |
@@ -50,4 +56,6 @@ jobs:
           fi
           git add data.json
           git commit -m "chore(data): aggiorna catalogo $(date -u +'%Y-%m-%d %H:%M') UTC"
-          git push
+          # se un altro run ha committato nel frattempo, riallineo e riprovo
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

@@ -11,60 +11,89 @@ ferme per sempre. Ora ci sono **due livelli di aggiornamento**:
 
 ### 1. Aggiornamento nel browser, a ogni visita (zero configurazione)
 
-Apri il sito e parte subito una scansione:
+**Primo paint immediato.** Lo snapshot completo del catalogo (offerte + canali + data) è salvato
+in **IndexedDB** (`ar_db`): alla riapertura la pagina è piena prima ancora che parta una richiesta
+di rete. `data.json` viene poi riletto in background, senza bloccare niente.
 
-1. il browser scarica l'anteprima pubblica di ogni canale (`https://t.me/s/<canale>`)
-   passando da un proxy CORS pubblico (t.me non manda gli header CORS);
-2. `lib/tg.js` estrae dalle pagine solo le **offerte audio** (prezzo, prezzo pieno, sconto,
-   link d'acquisto, immagine, canale, data);
-3. le nuove offerte vengono unite a quelle già in `data.json` e salvate in `localStorage`,
-   quindi restano visibili anche se ricarichi la pagina o il proxy è giù;
-4. si ripete **ogni 3 minuti** mentre la pagina è aperta e quando torni sulla tab;
-5. il pulsante **“↻ Aggiorna ora”** forza un controllo immediato.
+**Proxy in gara, non in fila.** `t.me` non manda gli header CORS, quindi il browser deve passare
+da un proxy pubblico. Prima i proxy venivano provati uno dopo l'altro con timeout da 14 s: se i
+primi tre erano lenti, la pagina restava ferma. Ora su ogni canale partono **5 proxy in
+parallelo** con timeout di **4,5 s**: vince il primo che risponde con markup valido, gli altri
+vengono abortiti. Un canale "morto" costa 4,5 s, non 70.
 
-Il badge in alto mostra lo stato (`controllo 9 canali…`, `+3 nuove offerte`, `aggiornato 2 min fa`),
-e nella finestra “Canali monitorati” puoi disattivare l'aggiornamento automatico o aggiungere
-canali tuoi (restano solo sul tuo browser).
+**Scansione a rotazione, non 9 richieste insieme.** Il refresh gira ogni **30 s** e controlla
+**2–3 canali per volta**: in circa 90 secondi tutti i canali sono stati ripassati, senza mai
+martellare i proxy né bloccare la UI. “↻ Aggiorna ora” invece forza subito **tutti** i canali.
+Se un canale non risponde, lo riprova al giro successivo e nel frattempo restano visibili i dati
+in cache.
+
+In sintesi, per ogni visita:
+
+1. snapshot da IndexedDB → la griglia è subito visibile;
+2. `data.json` riletto in background (aggiornato dal workflow, vedi sotto);
+3. rotazione dei canali ogni 30 s che arricchisce il catalogo con le novità;
+4. il badge in alto racconta lo stato (`controllo 3 canali…`, `+2 nuove offerte`,
+   `aggiornato 4 min fa`); nella finestra “Canali monitorati” puoi spegnere l'auto-refresh o
+   aggiungere canali tuoi (restano solo sul tuo browser).
 
 Nessun server, nessuna chiave API: funziona anche solo aprendo `index.html` da GitHub Pages.
 
-> Nota: alcuni proxy pubblici ogni tanto vengono bloccati da reti aziendali o da Telegram.
-> L'app prova in sequenza 5 servizi diversi, ricorda quello che funziona e, se nessuno risponde,
-> continua a mostrare l'ultimo catalogo salvato.
+### 2. Aggiornamento server-side di `data.json` (la parte davvero robusta)
 
-### 2. Aggiornamento anche di `data.json` su GitHub (opzionale, 2 minuti)
+Questa è la parte che tiene in piedi tutto: **anche se tutti i proxy CORS sono giù**, il catalogo
+resta fresco perché è GitHub a rigenerarlo. Il workflow pronto è in
+**`docs/github-workflow-update-catalog.yml`**: ogni **12 minuti** scarica `t.me/s/<canale>` lato
+server, rigenera `data.json` con `scripts/scan.mjs`, fa girare i test e committa.
 
-Così il catalogo è aggiornato pure per chi visita il sito quando il browser non può parlare
-con Telegram (proxy bloccati) e su tutti i dispositivi.
+> Perché non è già attivo: GitHub accetta file in `.github/workflows/` solo da token con permesso
+> **`workflows`**, che l'app usata da questo ambiente non ha (`refusing to allow a GitHub App to
+> create or update workflow … without workflows permission`). Il file è quindi pronto in `docs/`
+> e va installato una volta — 2 minuti, sotto.
 
-Il workflow è pronto in **`docs/github-workflow-update-catalog.yml`**: rigenera `data.json`
-**ogni 20 minuti** con `scripts/scan.mjs` e fa commit. Va copiato una volta in
-`.github/workflows/update-catalog.yml` (il token di questo ambiente non ha il permesso
-`workflows` per creare file lì):
+#### Attivarlo in 2 minuti
 
-1. su GitHub: **Add file → Create new file**, percorso `.github/workflows/update-catalog.yml`,
-   incolla il contenuto di `docs/github-workflow-update-catalog.yml`, commit;
-2. oppure da terminale, sul branch che poi unirai in `main`:
-   ```bash
-   mkdir -p .github/workflows
-   cp docs/github-workflow-update-catalog.yml .github/workflows/update-catalog.yml
-   git add .github/workflows/update-catalog.yml
-   git commit -m "ci: aggiornamento automatico del catalogo"
-   git push
-   ```
-3. in **Settings → Actions → General → Workflow permissions** lascia
-   *“Read and write permissions”* (serve per il commit di `data.json`).
+**1. Installa il file del workflow** (una volta sola). Da terminale, sul branch che poi mergi in `main`:
 
-Puoi anche lanciarlo a mano: **Actions → Aggiorna catalogo auricolari → Run workflow**.
-Per cambiare canali senza toccare il codice: **Settings → Variables → New repository variable**
-`TELEGRAM_CHANNELS` con la lista separata da virgole (es. `sconticina,prezzitech,offertedale`).
+```bash
+bash scripts/install-workflow.sh   # copia docs/… in .github/workflows/ e fa il commit
+git push
+```
+
+Oppure a mano da GitHub: **Add file → Create new file**, percorso
+`.github/workflows/update-catalog.yml`, incolla il contenuto di
+`docs/github-workflow-update-catalog.yml`, commit.
+
+**2. Dai i permessi di scrittura** (serve per il commit di `data.json`):
+*Settings → Actions → General → Workflow permissions* → **Read and write permissions** → *Save*.
+
+**3. Abilita e lancia la prima volta**: tab **Actions** → se compare il banner
+*“Workflows aren't being run…”* / *“I understand my workflows, go ahead and enable them”* clicca
+**Enable**; poi **«Aggiorna catalogo auricolari» → Run workflow → Run workflow**.
+
+In ~1 minuto il job è verde e `data.json` è aggiornato nel repo. Da lì in poi gira da solo.
+GitHub può ritardare di qualche minuto nei momenti di punta: è normale, lo scheduler non è in
+tempo reale. Se salti il passo 2 il job fallisce in fondo con
+`remote: Permission to … denied` (il commit non passa).
+
+#### Comandi utili
+
+- **Aggiornare subito a mano**: *Actions → «Aggiorna catalogo auricolari» → Run workflow*.
+- **Cambiare i canali senza toccare il codice**: *Settings → Secrets and variables → Actions →
+  Variables → New repository variable*, nome `TELEGRAM_CHANNELS`, valore con la lista separata da
+  virgole (es. `sconticina,prezzitech,offertedale`).
+- **Finestra dell'archivio**: variabile `ARCHIVE_DAYS` (default `30`).
+- **Rigenerare `data.json` in locale senza rete** (normalizza le offerte già salvate):
+  ```bash
+  node scripts/scan.mjs --rebuild
+  ```
 
 ### In locale
 
 ```bash
-node test/run.mjs            # test del parser (fixture con markup Telegram reale)
+node test/run.mjs            # test del parser, dedupe e schede pro/contro
 node scripts/scan.mjs --dry  # scansione senza scrivere data.json
-node scripts/scan.mjs        # rigenera data.json
+node scripts/scan.mjs        # rigenera data.json (richiede rete verso t.me)
+node scripts/scan.mjs --rebuild  # normalizza data.json offline (senza rete)
 npx serve .                  # oppure: python3 -m http.server 8080
 ```
 
@@ -77,9 +106,29 @@ npx serve .                  # oppure: python3 -m http.server 8080
   (es. ScontiCina) sia quelli numerati tipo “1) … 2) …”, sia il formato compatto di Prezzi.Tech.
 - Filtra tutto ciò che non è audio (TV, robot aspirapolvere, casse, smartwatch…) con
   una blocklist di categorie e una allowlist di parole chiave (cuffie, auricolari, earbuds, TWS…).
-- Deduplica per titolo+prezzo: la stessa offerta pubblicata su più canali diventa una card sola
-  con la sezione “anche su @canale”.
+- **Deduplica per modello, non per titolo**: `lib/models.js` riconosce ~85 modelli diffusi
+  (AirPods Pro 2/3, Sony WH-1000XM5/XM4, Bose QC Ultra, Pixel Buds Pro 2/2a, FreeBuds SE 3 vs
+  SE 5 Max, Edifier W820NB, Soundcore P20i/P31i/P41i…) e costruisce una chiave
+  `marchio:modello`. Lo stesso prodotto segnalato da tre canali diventa **una card sola**, con il
+  **prezzo migliore** del gruppo, i badge `@canale A, @canale B` e `segnalato 3 volte`.
+  Anche i doppioni dentro lo stesso post vengono eliminati.
+- **Marca e categoria dedotte dal modello**, non solo dal titolo: “Auricolari true wireless Pixel
+  Buds Pro 2” → Google / TWS; “HUAWEI CUFFIE TRUE WIRELESS” (dove il modello sta nel testo) →
+  Huawei / FreeBuds SE 3. La categoria resta la forma fisica (`tws`, `cuffie`, `open`, `sport`,
+  `gaming`): l'ANC è un flag separato (`hasAnc`), quindi un modello ANC non sparisce più dal
+  filtro “Cuffie over-ear” e il chip “🔇 ANC” continua a funzionare.
+- **Store sempre riconosciuto**: hashtag (`#Amazon`), riga `🛍 Amazon`, `Venduto e spedito da …`,
+  dominio del link e — per i link accorciati (`prezzi.tech/go`, `ofclub.click`, `scontify.net`) —
+  il testo del post. Niente più etichetta generica “Store”.
+- **Pro e contro al tocco**: toccando una card si apre un pannello sopra “Vai all'offerta” con
+  **2 pro e 2 contro** e la tabella delle specifiche (ANC in dB, autonomia, Bluetooth, codec,
+  multipoint, IP, peso, microfoni). I valori arrivano dalle specifiche lette nel post (marcate
+  `post`) e dall'anagrafica curata dei modelli. Per i modelli meno noti la scheda lo dice
+  esplicitamente: nei post Telegram le specifiche spesso mancano, quindi la tabella può essere
+  parziale.
 - Le offerte restano in archivio 30 giorni (max 900), prezzo/sconto ricalcolati dal testo.
+  Le card “fantasma” (righe di venditore come titolo, importi di risparmio scambiati per prezzi)
+  vengono scartate in fase di normalizzazione.
 
 ## Struttura
 
@@ -88,9 +137,11 @@ index.html                 app statica (GitHub Pages)
 app.js                     UI + scansione on-demand nel browser
 styles.css                 stile
 lib/tg.js                  parser Telegram + merge/dedupe/stats (browser + Node)
+lib/models.js              anagrafica ~85 modelli + specifiche + pro/contro
 scripts/scan.mjs           CLI che rigenera data.json
+scripts/install-workflow.sh  installa il workflow in .github/workflows/
 test/run.mjs               test del parser (npm-free, `node test/run.mjs`)
-.github/workflows/update-catalog.yml   aggiornamento periodico di data.json
+docs/github-workflow-update-catalog.yml  workflow da installare (aggiornamento ogni 12 min)
 data.json                  snapshot del catalogo servito dal sito
 ```
 

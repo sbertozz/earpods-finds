@@ -113,6 +113,8 @@
           <div class="filter-block toggles">
             <label class="toggle"><input type="checkbox" id="only24" /> Solo ultime 24h</label>
             <label class="toggle"><input type="checkbox" id="hideSeen" /> Nascondi già viste</label>
+            <label class="toggle"><input type="checkbox" id="onlyAnc" /> 🔇 Solo con ANC</label>
+            <label class="toggle"><input type="checkbox" id="onlyMulti" /> 👥 Segnalate da più canali</label>
             <button class="btn ghost small" id="resetFilters">Azzera filtri</button>
           </div>
         </div>
@@ -146,10 +148,11 @@
           <div>
             <h4>Come funziona</h4>
             <p>
-              Ogni volta che apri il sito la web app rilegge l'anteprima pubblica (<code>t.me/s/…</code>)
-              dei canali Telegram tech italiani, estrae prezzo, sconto, link e immagine di ogni offerta
-              e tiene solo quelle di <strong>auricolari, cuffie e true wireless</strong>. Poi si aggiorna
-              da sola ogni 3 minuti mentre la pagina resta aperta.
+              Ogni prodotto ha <strong>una sola card</strong>: se lo stesso modello viene segnalato da più
+              canali vedi il prezzo migliore, tutti i canali e quante volte è stato segnalato. Toccando la
+              card si apre la scheda con <strong>2 pro e 2 contro</strong> e le specifiche (ANC, autonomia,
+              codec, peso…). La pagina si apre subito dallo snapshot locale e intanto aggiorna in background
+              l'anteprima pubblica (<code>t.me/s/…</code>) a rotazione, pochi canali alla volta.
             </p>
           </div>
           <div>
@@ -159,6 +162,8 @@
           <div>
             <h4>Note</h4>
             <p class="tiny">
+              Le schede pro/contro combinano i dati del post con un'anagrafica curata dei modelli più
+              diffusi: per i modelli meno noti possono essere parziali.
               I prezzi sono quelli indicati nei post al momento della pubblicazione: verifica sempre
               il prezzo finale sul sito dello store. I link potrebbero essere affiliati dei canali
               originali. Il sito Telegram di anteprima mostra solo gli ultimi messaggi: per i canali
