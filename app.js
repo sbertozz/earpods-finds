@@ -7,9 +7,11 @@ import {
   extractOffers,
   mergeDeals,
   pruneDeals,
+  renormalizeDeals,
   computeStats,
   buildChannels,
 } from "./lib/tg.js";
+import { buildProfile } from "./lib/models.js";
 
 const state = {
   q: "",
@@ -21,6 +23,8 @@ const state = {
   minDiscount: 0,
   only24: false,
   hideSeen: false,
+  onlyAnc: false,
+  onlyMulti: false,
   limit: 48,
   offset: 0,
   total: 0,
@@ -56,6 +60,8 @@ const el = {
   minDiscountOut: $("#minDiscountOut"),
   only24: $("#only24"),
   hideSeen: $("#hideSeen"),
+  onlyAnc: $("#onlyAnc"),
+  onlyMulti: $("#onlyMulti"),
   loadMore: $("#loadMore"),
   toastStack: $("#toastStack"),
   newPill: $("#newPill"),
@@ -115,6 +121,9 @@ const LIVE = {
   busy: false,          // scansione in corso
   lastAttemptAt: 0,     // ultima scansione (anche fallita)
   lastResult: null,     // { added, updated, seconds }
+  proxy: null,          // proxy che ha vinto l'ultima corsa
+  cursor: 0,            // indice del prossimo canale da controllare (rotazione)
+  lastScanByChannel: {},// { canale: timestamp } per non ripetere lo stesso canale
 };
 
 const CFG = {
@@ -123,10 +132,12 @@ const CFG = {
     return [...new Set([...DEFAULT_CHANNELS, ...custom])];
   },
   autoScan: localStorage.getItem("ar_autoscan") !== "0",
-  /** intervallo tra due scansioni automatiche (ms) */
-  intervalMs: Number(localStorage.getItem("ar_scan_interval") || 180000),
-  /** non riscansiono più spesso di così (ms) */
-  minGapMs: 60000,
+  /** ogni quanto parte un tick di scansione a rotazione (ms) */
+  intervalMs: 30000,
+  /** quanti canali controllo per tick: pochi alla volta, mai 9 richieste insieme */
+  batchSize: 3,
+  /** non riscansiono lo stesso canale prima di così (ms) */
+  minGapMs: 55000,
   /** quante pagine di archivio Telegram scaricare per canale */
   maxPages: 1,
   days: 30,
@@ -152,9 +163,13 @@ function staticQuery(params) {
     if (!d.isAudio) return false;
     if (brand && d.brand !== brand) return false;
     if (store && d.store !== store) return false;
-    if (category && d.category !== category) return false;
+    if (category === "anc") {
+      if (!(d.hasAnc || d.category === "anc")) return false;
+    } else if (category && d.category !== category) return false;
     if (channel && d.channel !== channel) return false;
     if (minDiscount && (d.discount || 0) < minDiscount) return false;
+    if (state.onlyAnc && !(d.hasAnc || d.category === "anc")) return false;
+    if (state.onlyMulti && !((d.alsoOn || []).length || (d.seenCount || 1) > 1)) return false;
     if (maxPrice !== null && (d.price ?? Infinity) > maxPrice) return false;
     if (minPrice !== null && (d.price ?? 0) < minPrice) return false;
     if (q) {
@@ -196,10 +211,8 @@ async function loadBootstrap() {
   // la build statica (GitHub Pages) inietta <meta name="static-mode" content="1">
   const isStaticBuild = document.querySelector('meta[name="static-mode"]');
   if (isStaticBuild) {
-    const res = await fetch("./data.json", { cache: "no-store" });
-    STATIC_DATA = await res.json();
     MODE = "static";
-    return { channels: STATIC_DATA.channels || [] };
+    return { channels: [] }; // data.json arriva dopo, in background
   }
   try {
     const ch = await api("/channels");
@@ -276,6 +289,132 @@ function saveArchive() {
       /* niente storage: pazienza */
     }
   }
+  saveSnapshot();
+}
+
+/* ──────────────  Snapshot in IndexedDB (primo paint immediato)  ──────────────
+   localStorage è lento e limitato a ~5 MB; con 30-80 offerte ci sta stretto.
+   Qui salvo lo snapshot completo (offerte + canali + data) in IndexedDB: alla
+   riapertura la pagina mostra subito lo snapshot e solo DOPO aggiorna in
+   background da data.json e dai canali. Niente "pagina bloccata". */
+
+const DB_NAME = "ar_db";
+const DB_STORE = "snapshot";
+const DB_KEY = "catalog";
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") return reject(new Error("IndexedDB non disponibile"));
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("apertura IndexedDB fallita"));
+  });
+}
+
+async function idbGet(key = DB_KEY) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readonly");
+    const req = tx.objectStore(DB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(value, key = DB_KEY) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put(value, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/** snapshot compatto: il testo lungo non serve al primo paint */
+function snapshotPayload() {
+  return {
+    savedAt: new Date().toISOString(),
+    generatedAt: LIVE.generatedAt,
+    scans: LIVE.scans,
+    channels: LIVE.channels,
+    cursor: LIVE.cursor,
+    lastScanByChannel: LIVE.lastScanByChannel,
+    deals: LIVE.deals.map((d) => ({
+      ...d,
+      text: String(d.text || "").slice(0, 300),
+      // le specifiche sono ricalcolabili: le tengo, sono piccole
+    })),
+  };
+}
+
+/** salva lo snapshot senza bloccare l'interfaccia */
+let idbWriteTimer = null;
+function saveSnapshot() {
+  clearTimeout(idbWriteTimer);
+  idbWriteTimer = setTimeout(() => {
+    const payload = snapshotPayload();
+    idbSet(payload).catch(() => {
+      // browser privato o quota: ripiego su localStorage (versione leggera)
+      try {
+        localStorage.setItem("ar_snapshot", JSON.stringify({ ...payload, deals: payload.deals.slice(0, 120) }));
+      } catch {
+        /* niente storage: pazienza */
+      }
+    });
+  }, 600);
+}
+
+/** legge lo snapshot: IndexedDB, poi localStorage come riserva */
+async function loadSnapshot() {
+  try {
+    const snap = await idbGet();
+    if (snap?.deals?.length) return snap;
+  } catch {
+    /* IndexedDB bloccata (Safari privato, iframe): provo localStorage */
+  }
+  try {
+    const raw = localStorage.getItem("ar_snapshot");
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* nulla da recuperare */
+  }
+  return null;
+}
+
+/** applica uno snapshot allo stato vivo (senza toccare la UI) */
+function applySnapshot(snap) {
+  if (!snap) return false;
+  if (Array.isArray(snap.deals) && snap.deals.length) {
+    LIVE.deals = renormalizeDeals(snap.deals).deals;
+  }
+  if (snap.channels && typeof snap.channels === "object") LIVE.channels = snap.channels;
+  if (snap.generatedAt) LIVE.generatedAt = snap.generatedAt;
+  if (Number.isFinite(snap.scans)) LIVE.scans = snap.scans;
+  if (Number.isFinite(snap.cursor)) LIVE.cursor = snap.cursor;
+  if (snap.lastScanByChannel && typeof snap.lastScanByChannel === "object") LIVE.lastScanByChannel = snap.lastScanByChannel;
+  return Boolean(LIVE.deals.length);
+}
+
+/** data.json in background: non blocca il primo paint */
+async function syncStaticData() {
+  try {
+    const res = await fetch(`./data.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return false;
+    const json = await res.json();
+    if (!json?.deals?.length) return false;
+    STATIC_DATA = json;
+    seedLiveData();
+    saveArchive();
+    saveSnapshot();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** unisce data.json con l'archivio locale (via nuova, senza perdere le novità) */
@@ -343,14 +482,21 @@ function toastInfo(text) {
    servizi in sequenza e tengo quello che funziona (con cache in localStorage).
    Tutto gira in parallelo e con limiti di tempo: la pagina resta reattiva. */
 
+/* Proxy CORS pubblici. t.me non manda header CORS: senza proxy il browser non
+   può leggere l'anteprima. Non c'è un proxy che funziona sempre, quindi li
+   lancio TUTTI IN PARALLELO sullo stesso canale: vince il primo che risponde
+   con markup valido, gli altri vengono abortiti. */
 const PROXIES = [
-  { id: "allorigins", build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { id: "corsproxy", build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+  { id: "allorigins-raw", build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
   { id: "codetabs", build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
-  { id: "corsproxy-io", build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+  { id: "allorigins-get", build: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}` },
   { id: "thingproxy", build: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
-  { id: "r.jina.ai", build: (u) => `https://r.jina.ai/${u}` },
 ];
 
+/** timeout della corsa: oltre questo, il canale è considerato irraggiungibile */
+const PROXY_TIMEOUT_MS = 4500;
+/** quanto "pesa" un proxy che ha già funzionato (parte un filo avanti) */
 function proxyOrder() {
   const saved = localStorage.getItem("ar_proxy");
   const list = [...PROXIES];
@@ -361,34 +507,92 @@ function proxyOrder() {
   return list;
 }
 
-async function fetchTimeout(url, ms = 12000) {
+function fetchTimeout(url, ms = PROXY_TIMEOUT_MS, signal = null) {
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = setTimeout(() => ctrl?.abort(), ms);
-  try {
-    const res = await fetch(url, { signal: ctrl?.signal, cache: "no-store", redirect: "follow" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    if (text.length < 4000) throw new Error("risposta troppo corta");
-    return text;
-  } finally {
-    clearTimeout(timer);
+  const onAbort = () => ctrl?.abort();
+  if (signal) {
+    if (signal.aborted) ctrl?.abort();
+    else signal.addEventListener("abort", onAbort, { once: true });
   }
+  const timer = setTimeout(() => ctrl?.abort(), ms);
+  return fetch(url, { signal: ctrl?.signal, cache: "no-store", redirect: "follow" })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (text.length < 2000) throw new Error("risposta troppo corta");
+      return text;
+    })
+    .finally(() => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    });
 }
 
-/** scarica l'anteprima di un canale provando i proxy finché uno funziona */
-async function fetchChannelPage(channel) {
-  const target = `https://t.me/s/${encodeURIComponent(channel)}`;
-  for (const proxy of proxyOrder()) {
+/** estrae l'HTML Telegram da una risposta (allorigins/get incapsula in JSON) */
+function unwrapProxyPayload(text = "") {
+  if (/tgme_widget_message|tgme_channel_info/i.test(text)) return text;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) {
     try {
-      const text = await fetchTimeout(proxy.build(target), 14000);
-      if (!/tgme_widget_message|tgme_channel_info/i.test(text)) throw new Error("markup inatteso");
-      localStorage.setItem("ar_proxy", proxy.id);
-      return text;
+      const json = JSON.parse(trimmed);
+      const inner = json?.contents || json?.body || json?.data || "";
+      if (typeof inner === "string" && /tgme_widget_message/i.test(inner)) return inner;
     } catch {
-      /* provo il prossimo proxy */
+      /* non era JSON: pazienza */
     }
   }
-  throw new Error("canali non raggiungibili");
+  return null;
+}
+
+/**
+ * Scarica l'anteprima di un canale mettendo i proxy in gara.
+ * Il primo che restituisce markup valido vince; gli altri vengono abortiti
+ * (niente richieste "zombie" che occupano la banda).
+ */
+async function fetchChannelPage(channel) {
+  const target = `https://t.me/s/${encodeURIComponent(channel)}`;
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const list = proxyOrder();
+  let settled = false;
+
+  const attempt = (proxy) =>
+    fetchTimeout(proxy.build(target), PROXY_TIMEOUT_MS, ctrl?.signal).then((text) => {
+      const html = unwrapProxyPayload(text);
+      if (!html) throw new Error("markup inatteso");
+      return { proxy, html };
+    });
+
+  try {
+    const winner = await new Promise((resolve, reject) => {
+      const errors = [];
+      list.forEach((proxy) => {
+        attempt(proxy).then(
+          (ok) => {
+            if (settled) return;
+            settled = true;
+            resolve(ok);
+          },
+          (err) => {
+            errors.push(`${proxy.id}: ${err?.message || "errore"}`);
+            if (errors.length === list.length && !settled) reject(new Error(errors.join(" · ")));
+          },
+        );
+      });
+      // rete lenta: chiudo tutto al timeout globale, non lascio la pagina appesa
+      setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("timeout proxy"));
+        }
+      }, PROXY_TIMEOUT_MS + 900);
+    });
+    ctrl?.abort(); // fermo i proxy perdenti
+    localStorage.setItem("ar_proxy", winner.proxy.id);
+    LIVE.proxy = winner.proxy.id;
+    return winner.html;
+  } finally {
+    settled = true;
+  }
 }
 
 async function mapLimit(items, limit, fn) {
@@ -431,27 +635,60 @@ function incomingOffersFromPage(channel, html) {
  * Scansiona tutti i canali e fonde le nuove offerte nell'archivio.
  * @param {{manual?:boolean, quiet?:boolean}} opts
  */
+/**
+ * Sceglie i canali da controllare adesso.
+ * - manual: tutti
+ * - automatico: 2-3 canali a rotazione, così ogni ~30 s c'è qualcosa di fresco
+ *   senza sparare 9 richieste insieme (e senza essere bloccati dai proxy).
+ */
+function nextChannelBatch(manual = false) {
+  const channels = CFG.channels();
+  if (manual || channels.length <= CFG.batchSize) return channels;
+  const now = Date.now();
+  const due = [];
+  for (let i = 0; i < channels.length && due.length < CFG.batchSize; i++) {
+    const ch = channels[(LIVE.cursor + i) % channels.length];
+    const last = LIVE.lastScanByChannel[ch] || 0;
+    if (now - last >= CFG.minGapMs) due.push(ch);
+  }
+  // tutti controllati da poco: riparto dal più "vecchio"
+  const picked = due.length
+    ? due
+    : [...channels].sort((a, b) => (LIVE.lastScanByChannel[a] || 0) - (LIVE.lastScanByChannel[b] || 0)).slice(0, 1);
+  LIVE.cursor = (LIVE.cursor + picked.length) % channels.length;
+  return picked;
+}
+
+/**
+ * Scansiona i canali (tutti se manuale, altrimenti un sottoinsieme a rotazione)
+ * e fonde le offerte nell'archivio. Non blocca mai il render: chi chiama non
+ * aspetta il risultato per mostrare la pagina.
+ * @param {{manual?:boolean, quiet?:boolean}} opts
+ */
 async function scanNow({ manual = false, quiet = false } = {}) {
   if (MODE !== "static" || LIVE.busy) return LIVE.lastResult;
-  const now = Date.now();
-  if (!manual && now - LIVE.lastAttemptAt < CFG.minGapMs) return LIVE.lastResult;
-  if (manual && now - LIVE.lastAttemptAt < 15000) return LIVE.lastResult;
+
+  const channels = nextChannelBatch(manual);
+  if (!channels.length) return LIVE.lastResult;
 
   LIVE.busy = true;
-  LIVE.lastAttemptAt = now;
   const started = performance.now();
-  const channels = CFG.channels();
-  setLive("scanning", `controllo ${channels.length} canali…`);
   if (manual) {
+    setLive("scanning", `controllo ${channels.length} canali…`);
     const btn = $("#refreshBtn");
     if (btn) {
       btn.disabled = true;
       btn.textContent = "↻ aggiorno…";
     }
+  } else if (!LIVE.lastResult) {
+    setLive("scanning", `controllo ${channels.length} canali…`);
   }
 
   try {
-    const results = await mapLimit(channels, 3, (ch) => fetchChannelPage(ch).then((html) => incomingOffersFromPage(ch, html)));
+    // in gara: ogni canale ha i suoi proxy in parallelo (2 canali insieme)
+    const results = await mapLimit(channels, 2, (ch) =>
+      fetchChannelPage(ch).then((html) => incomingOffersFromPage(ch, html)),
+    );
     const incoming = [];
     let ok = 0;
     let failed = 0;
@@ -459,9 +696,14 @@ async function scanNow({ manual = false, quiet = false } = {}) {
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
       const ch = channels[i];
+      LIVE.lastScanByChannel[ch] = Date.now();
       if (!r || r.error) {
         failed += 1;
-        metaUpdates[ch] = { ...(LIVE.channels[ch] || {}), error: String(r?.error?.message || "errore"), lastScanAt: new Date().toISOString() };
+        metaUpdates[ch] = {
+          ...(LIVE.channels[ch] || {}),
+          error: String(r?.error?.message || "errore"),
+          lastScanAt: new Date().toISOString(),
+        };
         continue;
       }
       ok += 1;
@@ -471,7 +713,10 @@ async function scanNow({ manual = false, quiet = false } = {}) {
     }
 
     const fresh = incoming.filter((d) => d.isAudio);
-    const { deals, added } = mergeDeals(LIVE.deals, fresh, new Date().toISOString());
+    // prima ripulisco l'archivio con le regole correnti (store/modello/categorie),
+    // poi fondo le novità: così le card vecchie spariscono da sole
+    const base = renormalizeDeals(LIVE.deals).deals;
+    const { deals, added } = mergeDeals(base, fresh, new Date().toISOString());
     LIVE.deals = pruneDeals(deals, { days: CFG.days, max: CFG.maxDeals });
     LIVE.channels = { ...LIVE.channels, ...metaUpdates };
     LIVE.errors = failed;
@@ -485,6 +730,7 @@ async function scanNow({ manual = false, quiet = false } = {}) {
       seconds: Math.round((performance.now() - started) / 100) / 10,
       ok,
       failed,
+      channels: channels.length,
       at: new Date().toISOString(),
     };
     saveArchive();
@@ -492,12 +738,12 @@ async function scanNow({ manual = false, quiet = false } = {}) {
     renderBotStatus();
 
     if (ok === 0) {
-      setLive("offline", "canali non raggiungibili");
+      if (!LIVE.available) setLive("offline", "canali non raggiungibili");
       if (manual) toastInfo("Non riesco a contattare Telegram da questo browser (proxy bloccati o rete aziendale).");
       return LIVE.lastResult;
     }
     if (!quiet) {
-      setLive("ok", added.length ? `+${added.length} nuove offerte` : "catalogo aggiornato");
+      if (manual || added.length) setLive("ok", added.length ? `+${added.length} nuove offerte` : "catalogo aggiornato");
       if (added.length) {
         const names = added.slice(0, 3).map((d) => d.title).join(" · ");
         toastInfo(`${added.length} nuov${added.length === 1 ? "a offerta" : "e offerte"} · ${names}${added.length > 3 ? "…" : ""}`);
@@ -519,19 +765,22 @@ async function scanNow({ manual = false, quiet = false } = {}) {
   }
 }
 
-/** avvia il refresh: subito all'apertura + ogni N minuti se la pagina è visibile */
+/**
+ * Refresh continuo ma leggero: un tick ogni ~30 s che controlla 2-3 canali a
+ * rotazione. In 90 secondi l'intero elenco è stato ripassato, senza mai
+ * bloccare la pagina e senza martellare i proxy.
+ */
 function startAutoScan() {
   if (MODE !== "static") return;
   const kick = () => {
-    if (!CFG.autoScan || document.hidden) return;
-    scanNow({ manual: false }).catch(() => {});
+    if (!CFG.autoScan || document.hidden || LIVE.busy) return;
+    scanNow({ manual: false, quiet: true }).catch(() => {});
   };
-  // prima scansione dopo che la UI è visibile (non bloccare il primo render)
-  setTimeout(kick, 900);
+  // primo giro dopo il primo paint: la pagina è già visibile con lo snapshot
+  setTimeout(kick, 1200);
   setInterval(kick, CFG.intervalMs);
-  // quando torni sulla tab, se sono passati >2 min aggiorno subito
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && Date.now() - LIVE.lastAttemptAt > 120000) kick();
+    if (!document.hidden) kick();
   });
   window.addEventListener("online", kick);
 }
@@ -618,7 +867,11 @@ function renderFilterChips() {
   const s = state.stats;
   if (!s) return;
   const catLabels = { tws: "Auricolari TWS", cuffie: "Cuffie over-ear", anc: "Con ANC", gaming: "Gaming", sport: "Sport", open: "Open-ear" };
-  el.categoryChips.innerHTML = pairs(s.categories)
+  const cats = pairs(s.categories);
+  const ancCount = s.ancCount ?? (cats.find(([k]) => k === "anc")?.[1] || 0);
+  const rest = cats.filter(([k]) => k !== "anc");
+  const shown = ancCount ? [...rest, ["anc", ancCount]] : rest;
+  el.categoryChips.innerHTML = shown
     .filter(([, n]) => n > 0)
     .map(
       ([k, n]) =>
@@ -664,6 +917,47 @@ const ICON = {
   cart: svg('<circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M2.5 3.5h2.2l2.6 11.2h11.4l2.3-8.4H6"/>'),
 };
 
+/** scheda dettaglio: 2 pro + 2 contro + specifiche (nascosta finché non tocchi la card) */
+function detailPanel(d, isSeen) {
+  const profile = buildProfile(d);
+  const rows = profile.specs
+    .slice(0, 8)
+    .map(
+      (r) =>
+        `<div class="spec-row"><span class="spec-k">${esc(r.label)}</span><span class="spec-v">${esc(r.value)}${
+          r.source === "post" ? `<span class="spec-src" title="Letto nel post Telegram">post</span>` : ""
+        }</span></div>`,
+    )
+    .join("");
+  const proItems = profile.pros.map((p) => `<li><span class="pc-ico pro">+</span><span>${esc(p)}</span></li>`).join("");
+  const conItems = profile.cons.map((c) => `<li><span class="pc-ico con">−</span><span>${esc(c)}</span></li>`).join("");
+
+  return `
+  <div class="card-detail" hidden>
+    <div class="pc-grid">
+      <div class="pc-col pros">
+        <h4>Pro</h4>
+        <ul>${proItems}</ul>
+      </div>
+      <div class="pc-col cons">
+        <h4>Contro</h4>
+        <ul>${conItems}</ul>
+      </div>
+    </div>
+    ${rows ? `<div class="spec-table">${rows}</div>` : ""}
+    ${
+      profile.partial
+        ? `<p class="detail-note">${
+            profile.known
+              ? "Specifiche parziali: nel post Telegram non c'erano tutti i dati. Completa la scheda sulla pagina dello store prima di comprare."
+              : "Modello poco diffuso: la tabella è parziale perché nei post Telegram spesso non ci sono le specifiche complete. Verifica sullo store."
+          }</p>`
+        : `<p class="detail-note ok">Scheda completa: dati del modello e del post coincidono.</p>`
+    }
+    ${d.postSpecs?.notes?.length ? `<p class="detail-note">Nel post: ${esc(d.postSpecs.notes.join(" · "))}</p>` : ""}
+  </div>`;
+}
+
 function cardHtml(d, isNew) {
   const price = euro(d.price);
   const old = euro(d.oldPrice);
@@ -672,10 +966,6 @@ function cardHtml(d, isNew) {
     ? `<img src="${esc(d.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none';this.parentElement.querySelector('.ph').style.display='grid'">
        <span class="ph" style="display:none">🎧</span>`
     : `<span class="ph">🎧</span>`;
-  const alsoOn = (d.alsoOn || [])
-    .slice(0, 3)
-    .map((o) => `<a href="https://t.me/${esc(o.channel)}" target="_blank" rel="noopener" title="Stessa offerta anche qui">@${esc(o.channel)}</a>`)
-    .join("");
   const isSeen = state.seen.has(d.key);
 
   return `
@@ -718,7 +1008,15 @@ function cardHtml(d, isNew) {
           <button class="icon-btn" data-act="tg" title="Apri il post su Telegram" aria-label="Apri Telegram">${ICON.plane}</button>
         </div>
       </div>
-      ${alsoOn ? `<div class="also-on">${alsoOn}</div>` : ""}
+      ${(d.alsoOn || []).length || d.seenCount > 1 ? `<div class="also-on">
+        ${(d.alsoOn || []).slice(0, 4).map((o) => `<a href="${esc(o.messageUrl || `https://t.me/${o.channel}`)}" target="_blank" rel="noopener" title="Stessa offerta anche su @${esc(o.channel)}">@${esc(o.channel)}</a>`).join("")}
+        ${d.seenCount > 1 ? `<span class="seen-count">segnalato ${d.seenCount} volte${(d.alsoOn || []).length ? ` su ${(d.alsoOn || []).length + 1} canali` : ""}</span>` : ""}
+      </div>` : ""}
+      ${detailPanel(d, isSeen)}
+      <button class="card-cta-main" data-act="toggle-detail" type="button" aria-expanded="false">
+        <span class="cta-label">Pro e contro</span>
+        <span class="cta-chevron" aria-hidden="true">▾</span>
+      </button>
       <a class="card-cta" href="${esc(d.url || d.telegramUrl)}" target="_blank" rel="noopener nofollow sponsored">
         ${ICON.cart}<span>${price ? `Vai all'offerta · ${price}` : "Vedi l'offerta"}</span>
       </a>
@@ -935,6 +1233,8 @@ const resetFilters = () => {
   el.minDiscountOut.textContent = "0%";
   el.only24.checked = false;
   el.hideSeen.checked = false;
+  el.onlyAnc.checked = false;
+  el.onlyMulti.checked = false;
   renderFilterChips();
   loadDeals();
 };
@@ -942,6 +1242,16 @@ $("#resetFilters").addEventListener("click", resetFilters);
 $("#emptyReset").addEventListener("click", resetFilters);
 
 el.loadMore.addEventListener("click", () => loadDeals({ append: true }));
+
+for (const [id, key] of [["onlyAnc", "onlyAnc"], ["onlyMulti", "onlyMulti"]]) {
+  const node = $(`#${id}`);
+  if (node) {
+    node.addEventListener("change", (e) => {
+      state[key] = e.currentTarget.checked;
+      loadDeals();
+    });
+  }
+}
 
 $("#refreshBtn").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
@@ -1019,14 +1329,37 @@ el.newPill.addEventListener("click", () => {
   updateNewPill();
 });
 
+/** apre/chiude la scheda pro/contro della card */
+function toggleDetail(card, force) {
+  const panel = card?.querySelector(".card-detail");
+  const btn = card?.querySelector('[data-act="toggle-detail"]');
+  if (!panel) return;
+  const open = force ?? panel.hidden;
+  panel.hidden = !open;
+  card.classList.toggle("expanded", open);
+  if (btn) {
+    btn.setAttribute("aria-expanded", String(open));
+    const label = btn.querySelector(".cta-label");
+    if (label) label.textContent = open ? "Chiudi scheda" : "Pro e contro";
+  }
+}
+
 // Azioni sulle card
 el.feed.addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-act]");
-  if (!btn) return;
-  const card = btn.closest(".card");
+  const card = e.target.closest(".card");
+  if (!btn) {
+    // tocco sulla card (non sul link "Vai all'offerta") → apre la scheda
+    if (card && !e.target.closest("a")) toggleDetail(card);
+    return;
+  }
   const deal = state.deals.find((d) => d.key === card?.dataset.key);
   if (!deal) return;
   const act = btn.dataset.act;
+  if (act === "toggle-detail") {
+    toggleDetail(card);
+    return;
+  }
   if (act === "copy") {
     try {
       await navigator.clipboard.writeText(deal.url || deal.telegramUrl);
@@ -1189,41 +1522,44 @@ async function init() {
 
   const boot = await loadBootstrap();
   state.channels = boot.channels;
-  if (boot.channels.length) $("#heroChannels").textContent = boot.channels.length;
-  applyMode();
 
   if (MODE === "static") {
-    loadArchive();
+    // 1) snapshot locale → la pagina è subito piena (nessuna attesa di rete)
+    const snap = await loadSnapshot();
+    if (snap) applySnapshot(snap);
+    loadArchive();            // archivio "storico" come riserva
     seedLiveData();
     state.channels = currentChannels();
     if (state.channels.length) $("#heroChannels").textContent = state.channels.length;
-  }
+    await Promise.all([loadStats(), loadDeals()]);
+    renderChannelFooter();
+    applyMode();
 
-  await Promise.all([loadStats(), loadDeals()]);
-  await loadStats();
-
-  if (MODE === "live") {
-    connectSSE();
-    setInterval(loadStats, 60000); // stats fresche
-  } else {
+    // 2) aggiornamento in background: data.json + canali a rotazione
     const label = () => {
       if (LIVE.busy) return;
       const when = LIVE.generatedAt || STATIC_DATA?.generatedAt;
-      const ago = when ? timeAgoIt(when) : "";
-      setLive("ok", when ? `aggiornato ${ago}` : "pronto");
+      setLive(LIVE.available ? "ok" : "idle", when ? `aggiornato ${timeAgoIt(when)}` : "pronto");
     };
     label();
     setInterval(label, 30000);
-    // ogni tanto ricordo quando è stato fatto l'ultimo controllo
-    setInterval(() => {
-      if (LIVE.busy || !LIVE.lastResult) return;
-      const r = LIVE.lastResult;
-      if (Date.now() - new Date(r.at).getTime() < 25000) return;
-      setLive(r.ok ? "ok" : "offline", r.ok ? `ultimo controllo ${timeAgoIt(r.at)}` : "canali non raggiungibili");
-    }, 60000);
+
+    syncStaticData().then(async (fresh) => {
+      if (fresh) {
+        await Promise.all([loadStats(), loadDeals()]);
+        renderChannelFooter();
+      }
+    });
     renderBotStatus();
     startAutoScan();
+    return;
   }
+
+  if (boot.channels.length) $("#heroChannels").textContent = boot.channels.length;
+  applyMode();
+  await Promise.all([loadStats(), loadDeals()]);
+  connectSSE();
+  setInterval(loadStats, 60000); // stats fresche
 }
 
 init();
