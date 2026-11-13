@@ -1,6 +1,15 @@
 /* ───────────────────────────────────────────────────────────────
    Auricolari Radar — frontend (vanilla JS, zero dipendenze)
    ─────────────────────────────────────────────────────────────── */
+import {
+  DEFAULT_CHANNELS,
+  parseChannelPage,
+  extractOffers,
+  mergeDeals,
+  pruneDeals,
+  computeStats,
+  buildChannels,
+} from "./lib/tg.js";
 
 const state = {
   q: "",
@@ -90,10 +99,39 @@ const debounce = (fn, ms = 260) => {
   };
 };
 /* ──────────────  Modalità: "live" (API) oppure "static" (GitHub Pages)  ──────────────
-   Se l'API non risponde (sito statico su GitHub Pages) il frontend legge data.json,
-   generato dal workflow .github/workflows/pages.yml. Stessa UI, stessi filtri. */
+   In modalità statica il frontend parte da data.json e poi si aggiorna da solo:
+   ad ogni visita scarica l'anteprima pubblica dei canali Telegram (t.me/s/…) e
+   aggiunge le nuove offerte, così il catalogo non resta mai fermo. */
 let MODE = "live";
 let STATIC_DATA = null;
+/* snapshot "vivo": data.json + archivio locale + scan on-demand */
+const LIVE = {
+  deals: [],            // tutte le offerte note (audio)
+  channels: {},         // { canale: {title, photo, lastMessageId, …} }
+  generatedAt: null,    // ultima scansione riuscita
+  scans: 0,             // scansioni complete
+  errors: 0,            // canali che hanno fallito all'ultimo giro
+  available: false,     // il browser è riuscito a leggere t.me almeno una volta
+  busy: false,          // scansione in corso
+  lastAttemptAt: 0,     // ultima scansione (anche fallita)
+  lastResult: null,     // { added, updated, seconds }
+};
+
+const CFG = {
+  channels: () => {
+    const custom = JSON.parse(localStorage.getItem("ar_extra_channels") || "[]");
+    return [...new Set([...DEFAULT_CHANNELS, ...custom])];
+  },
+  autoScan: localStorage.getItem("ar_autoscan") !== "0",
+  /** intervallo tra due scansioni automatiche (ms) */
+  intervalMs: Number(localStorage.getItem("ar_scan_interval") || 180000),
+  /** non riscansiono più spesso di così (ms) */
+  minGapMs: 60000,
+  /** quante pagine di archivio Telegram scaricare per canale */
+  maxPages: 1,
+  days: 30,
+  maxDeals: 600,
+};
 
 function staticQuery(params) {
   const get = (k) => params.get(k);
@@ -109,7 +147,8 @@ function staticQuery(params) {
   const limit = Number(get("limit") || 48);
   const offset = Number(get("offset") || 0);
 
-  let rows = (STATIC_DATA.deals || []).filter((d) => {
+  const source = LIVE.deals.length ? LIVE.deals : (STATIC_DATA?.deals || []);
+  let rows = source.filter((d) => {
     if (!d.isAudio) return false;
     if (brand && d.brand !== brand) return false;
     if (store && d.store !== store) return false;
@@ -141,8 +180,8 @@ async function api(path, opts = {}) {
     const [pathname, qs] = path.split("?");
     const params = new URLSearchParams(qs || "");
     if (pathname === "/deals") return staticQuery(params);
-    if (pathname === "/stats") return STATIC_DATA.stats;
-    if (pathname === "/channels") return { channels: STATIC_DATA.channels || [] };
+    if (pathname === "/stats") return currentStats();
+    if (pathname === "/channels") return { channels: currentChannels() };
     if (pathname === "/scan") return { ok: false, static: true };
     if (opts.method === "POST") throw new Error("La gestione dei canali non è disponibile nella versione statica (GitHub Pages).");
     throw new Error(`Endpoint ${path} non disponibile in modalità statica`);
@@ -181,22 +220,320 @@ async function loadBootstrap() {
   }
 }
 
+/* ──────────────  Snapshot "vivo" (modalità statica)  ────────────── */
+
+function currentStats(extra = {}) {
+  const deals = LIVE.deals.length ? LIVE.deals : (STATIC_DATA?.deals || []);
+  return computeStats(deals, LIVE.channels, {
+    lastScanAt: LIVE.generatedAt || STATIC_DATA?.generatedAt || null,
+    scans: LIVE.scans,
+    errors: LIVE.errors,
+    ...extra,
+  });
+}
+
+function currentChannels() {
+  const base = LIVE.deals.length ? buildChannels(LIVE.deals, LIVE.channels) : (STATIC_DATA?.channels || []);
+  return base.map((c) => ({ ...c, ...(LIVE.channels[c.channel] || {}) }));
+}
+
+/** carica l'archivio locale (offerte già viste su questo browser) */
+function loadArchive() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("ar_archive") || "null");
+    if (saved && Array.isArray(saved.deals) && saved.deals.length) {
+      LIVE.deals = saved.deals.filter((d) => d.isAudio !== false);
+    }
+    if (saved?.channels && typeof saved.channels === "object") LIVE.channels = saved.channels;
+    if (saved?.generatedAt) LIVE.generatedAt = saved.generatedAt;
+    if (Number.isFinite(saved?.scans)) LIVE.scans = saved.scans;
+  } catch {
+    /* archivio corrotto: riparto pulito */
+  }
+}
+
+function saveArchive() {
+  const slim = LIVE.deals.map((d) => ({ ...d, text: String(d.text || "").slice(0, 500) }));
+  try {
+    localStorage.setItem(
+      "ar_archive",
+      JSON.stringify({
+        savedAt: new Date().toISOString(),
+        generatedAt: LIVE.generatedAt,
+        scans: LIVE.scans,
+        channels: LIVE.channels,
+        deals: slim,
+      }),
+    );
+  } catch {
+    // quota piena: salvo solo le offerte più recenti (l'archivio resta in memoria)
+    try {
+      localStorage.setItem(
+        "ar_archive",
+        JSON.stringify({ generatedAt: LIVE.generatedAt, scans: LIVE.scans, channels: LIVE.channels, deals: slim.slice(0, 120) }),
+      );
+    } catch {
+      /* niente storage: pazienza */
+    }
+  }
+}
+
+/** unisce data.json con l'archivio locale (via nuova, senza perdere le novità) */
+function seedLiveData() {
+  const base = STATIC_DATA?.deals || [];
+  const { deals } = mergeDeals(
+    base.filter((d) => d.isAudio !== false),
+    LIVE.deals,
+    new Date().toISOString(),
+  );
+  LIVE.deals = pruneDeals(deals, { days: CFG.days, max: CFG.maxDeals });
+  if (!LIVE.generatedAt && STATIC_DATA?.generatedAt) LIVE.generatedAt = STATIC_DATA.generatedAt;
+  for (const c of STATIC_DATA?.channels || []) {
+    if (c?.channel && !LIVE.channels[c.channel]) LIVE.channels[c.channel] = { title: c.title, photo: c.photo };
+  }
+}
+
 /** Adatta l'interfaccia alla modalità statica */
 function applyMode() {
   const isStatic = MODE === "static";
   document.body.classList.toggle("static-mode", isStatic);
   if (!isStatic) return;
   const refresh = $("#refreshBtn");
-  if (refresh) refresh.textContent = "↻ Ricarica";
-  const addRow = document.querySelector(".add-channel");
-  if (addRow) addRow.hidden = true;
+  if (refresh) refresh.textContent = "↻ Aggiorna ora";
+  renderBotStatus();
+}
+
+function renderBotStatus() {
   const bot = $("#botStatus");
-  if (bot) {
-    const when = STATIC_DATA?.generatedAt ? timeAgoIt(STATIC_DATA.generatedAt) : "poco fa";
-    bot.innerHTML =
-      `🔄 Versione statica (GitHub Pages): offerte aggiornate <strong>${when}</strong> da GitHub Actions (ogni 15 minuti). ` +
-      `Per aggiungere canali modifica <code>TELEGRAM_CHANNELS</code> nel workflow <code>.github/workflows/pages.yml</code>.`;
+  if (!bot) return;
+  if (MODE !== "static") return;
+  const used = LIVE.generatedAt || STATIC_DATA?.generatedAt;
+  const when = used ? timeAgoIt(used) : "mai";
+  const extra = JSON.parse(localStorage.getItem("ar_extra_channels") || "[]");
+  bot.innerHTML =
+    `🔄 <strong>Aggiornamento automatico attivo</strong>: ad ogni visita (e ogni ${Math.round(CFG.intervalMs / 60000)} min) ` +
+    `rileggo i canali Telegram pubblici e aggiungo le nuove offerte. Ultimo controllo: <strong>${when}</strong>.` +
+    `<br/>Archivio locale: <strong>${LIVE.deals.length}</strong> offerte · scansioni: ${LIVE.scans}` +
+    (LIVE.errors ? ` · canali non raggiungibili: ${LIVE.errors}` : "") +
+    `<br/><label class="toggle" style="margin-top:8px"><input type="checkbox" id="autoscanToggle" ${CFG.autoScan ? "checked" : ""}/> Aggiorna automaticamente mentre il sito è aperto</label>` +
+    `<br/><span class="tiny">Puoi anche aggiungere canali extra: scrivili qui sotto e premi <em>Aggiorna ora</em> per includerli.</span>` +
+    (extra.length ? `<br/><span class="tiny">Canali personalizzati: ${extra.map((c) => `@${esc(c)}`).join(", ")}</span>` : "");
+  const toggle = $("#autoscanToggle");
+  if (toggle) {
+    toggle.addEventListener("change", (e) => {
+      localStorage.setItem("ar_autoscan", e.currentTarget.checked ? "1" : "0");
+      CFG.autoScan = e.currentTarget.checked;
+      toastInfo(e.currentTarget.checked ? "Aggiornamento automatico attivo" : "Aggiornamento automatico disattivato");
+    });
   }
+}
+
+function toastInfo(text) {
+  const node = document.createElement("div");
+  node.className = "toast";
+  node.innerHTML = `<div class="t-ph">🔄</div><div class="t-body"><div class="t-title">Auricolari Radar</div><div class="t-text">${esc(text)}</div></div>`;
+  el.toastStack.prepend(node);
+  setTimeout(() => node.classList.add("out"), 2600);
+  setTimeout(() => node.remove(), 2900);
+  while (el.toastStack.children.length > 3) el.toastStack.lastElementChild.remove();
+}
+
+/* ──────────────  Scanner: legge i canali Telegram dal browser  ──────────────
+   t.me non manda header CORS, quindi passo da proxy pubblici. Provo più
+   servizi in sequenza e tengo quello che funziona (con cache in localStorage).
+   Tutto gira in parallelo e con limiti di tempo: la pagina resta reattiva. */
+
+const PROXIES = [
+  { id: "allorigins", build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { id: "codetabs", build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+  { id: "corsproxy-io", build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+  { id: "thingproxy", build: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
+  { id: "r.jina.ai", build: (u) => `https://r.jina.ai/${u}` },
+];
+
+function proxyOrder() {
+  const saved = localStorage.getItem("ar_proxy");
+  const list = [...PROXIES];
+  if (saved) {
+    const i = list.findIndex((p) => p.id === saved);
+    if (i > 0) list.unshift(list.splice(i, 1)[0]);
+  }
+  return list;
+}
+
+async function fetchTimeout(url, ms = 12000) {
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = setTimeout(() => ctrl?.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: ctrl?.signal, cache: "no-store", redirect: "follow" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (text.length < 4000) throw new Error("risposta troppo corta");
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** scarica l'anteprima di un canale provando i proxy finché uno funziona */
+async function fetchChannelPage(channel) {
+  const target = `https://t.me/s/${encodeURIComponent(channel)}`;
+  for (const proxy of proxyOrder()) {
+    try {
+      const text = await fetchTimeout(proxy.build(target), 14000);
+      if (!/tgme_widget_message|tgme_channel_info/i.test(text)) throw new Error("markup inatteso");
+      localStorage.setItem("ar_proxy", proxy.id);
+      return text;
+    } catch {
+      /* provo il prossimo proxy */
+    }
+  }
+  throw new Error("canali non raggiungibili");
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      try {
+        out[idx] = await fn(items[idx], idx);
+      } catch (err) {
+        out[idx] = { error: err };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+function incomingOffersFromPage(channel, html) {
+  const page = parseChannelPage(html, channel);
+  const meta = {
+    title: page.info.title,
+    photo: page.info.photo,
+    description: page.info.description,
+    lastMessageId: page.posts.length ? page.posts[page.posts.length - 1].id : null,
+    lastScanAt: new Date().toISOString(),
+    lastOkAt: new Date().toISOString(),
+  };
+  const offers = [];
+  for (const post of page.posts) {
+    post.channelTitle = page.info.title;
+    post.channelPhoto = page.info.photo;
+    offers.push(...extractOffers(post));
+  }
+  return { meta, offers, posts: page.posts.length };
+}
+
+/**
+ * Scansiona tutti i canali e fonde le nuove offerte nell'archivio.
+ * @param {{manual?:boolean, quiet?:boolean}} opts
+ */
+async function scanNow({ manual = false, quiet = false } = {}) {
+  if (MODE !== "static" || LIVE.busy) return LIVE.lastResult;
+  const now = Date.now();
+  if (!manual && now - LIVE.lastAttemptAt < CFG.minGapMs) return LIVE.lastResult;
+  if (manual && now - LIVE.lastAttemptAt < 15000) return LIVE.lastResult;
+
+  LIVE.busy = true;
+  LIVE.lastAttemptAt = now;
+  const started = performance.now();
+  const channels = CFG.channels();
+  setLive("scanning", `controllo ${channels.length} canali…`);
+  if (manual) {
+    const btn = $("#refreshBtn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "↻ aggiorno…";
+    }
+  }
+
+  try {
+    const results = await mapLimit(channels, 3, (ch) => fetchChannelPage(ch).then((html) => incomingOffersFromPage(ch, html)));
+    const incoming = [];
+    let ok = 0;
+    let failed = 0;
+    const metaUpdates = {};
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const ch = channels[i];
+      if (!r || r.error) {
+        failed += 1;
+        metaUpdates[ch] = { ...(LIVE.channels[ch] || {}), error: String(r?.error?.message || "errore"), lastScanAt: new Date().toISOString() };
+        continue;
+      }
+      ok += 1;
+      LIVE.available = true;
+      metaUpdates[ch] = { ...(LIVE.channels[ch] || {}), ...r.meta, error: null };
+      incoming.push(...r.offers);
+    }
+
+    const fresh = incoming.filter((d) => d.isAudio);
+    const { deals, added } = mergeDeals(LIVE.deals, fresh, new Date().toISOString());
+    LIVE.deals = pruneDeals(deals, { days: CFG.days, max: CFG.maxDeals });
+    LIVE.channels = { ...LIVE.channels, ...metaUpdates };
+    LIVE.errors = failed;
+    if (ok > 0) {
+      LIVE.scans += 1;
+      LIVE.generatedAt = new Date().toISOString();
+    }
+    LIVE.lastResult = {
+      added: added.length,
+      updated: fresh.length - added.length,
+      seconds: Math.round((performance.now() - started) / 100) / 10,
+      ok,
+      failed,
+      at: new Date().toISOString(),
+    };
+    saveArchive();
+    await Promise.all([loadStats(), loadDeals()]);
+    renderBotStatus();
+
+    if (ok === 0) {
+      setLive("offline", "canali non raggiungibili");
+      if (manual) toastInfo("Non riesco a contattare Telegram da questo browser (proxy bloccati o rete aziendale).");
+      return LIVE.lastResult;
+    }
+    if (!quiet) {
+      setLive("ok", added.length ? `+${added.length} nuove offerte` : "catalogo aggiornato");
+      if (added.length) {
+        const names = added.slice(0, 3).map((d) => d.title).join(" · ");
+        toastInfo(`${added.length} nuov${added.length === 1 ? "a offerta" : "e offerte"} · ${names}${added.length > 3 ? "…" : ""}`);
+        if (manual) window.scrollTo({ top: 0, behavior: "smooth" });
+      } else if (manual) {
+        toastInfo("Nessuna nuova offerta: il catalogo è già aggiornato.");
+      }
+    }
+    return LIVE.lastResult;
+  } finally {
+    LIVE.busy = false;
+    if (manual) {
+      const btn = $("#refreshBtn");
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "↻ Aggiorna ora";
+      }
+    }
+  }
+}
+
+/** avvia il refresh: subito all'apertura + ogni N minuti se la pagina è visibile */
+function startAutoScan() {
+  if (MODE !== "static") return;
+  const kick = () => {
+    if (!CFG.autoScan || document.hidden) return;
+    scanNow({ manual: false }).catch(() => {});
+  };
+  // prima scansione dopo che la UI è visibile (non bloccare il primo render)
+  setTimeout(kick, 900);
+  setInterval(kick, CFG.intervalMs);
+  // quando torni sulla tab, se sono passati >2 min aggiorno subito
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && Date.now() - LIVE.lastAttemptAt > 120000) kick();
+  });
+  window.addEventListener("online", kick);
 }
 
 function queryParams(offset = state.offset) {
@@ -609,8 +946,19 @@ el.loadMore.addEventListener("click", () => loadDeals({ append: true }));
 $("#refreshBtn").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   if (MODE === "static") {
-    // su GitHub Pages i dati si aggiornano via Actions: ricarico con cache bypassata
-    location.href = `${location.pathname}?t=${Date.now()}`;
+    // rileggo subito i canali Telegram e poi ricarico data.json con cache bypassata
+    await scanNow({ manual: true });
+    const res = await fetch(`./data.json?t=${Date.now()}`, { cache: "no-store" }).catch(() => null);
+    if (res?.ok) {
+      try {
+        STATIC_DATA = await res.json();
+        seedLiveData();
+        saveArchive();
+        await Promise.all([loadStats(), loadDeals()]);
+      } catch {
+        /* data.json non aggiornato: resto sull'archivio locale */
+      }
+    }
     return;
   }
   btn.disabled = true;
@@ -718,18 +1066,27 @@ document.addEventListener("keydown", (e) => {
 async function loadChannels() {
   try {
     if (MODE === "static") {
-      const stats = STATIC_DATA.stats;
-      state.channels = STATIC_DATA.channels || [];
-      el.channelManage.innerHTML = state.channels
+      const extra = new Set(JSON.parse(localStorage.getItem("ar_extra_channels") || "[]"));
+      const list = currentChannels();
+      state.channels = list;
+      const newByChannel = LIVE.lastResult
+        ? Object.fromEntries(
+            LIVE.deals
+              .filter((d) => !d.firstSeenAt || Date.now() - new Date(d.firstSeenAt).getTime() < 86400000)
+              .map((d) => [d.channel, true]),
+          )
+        : {};
+      el.channelManage.innerHTML = list
         .map(
           (c) => `
         <li>
           ${c.photo ? `<img src="${esc(c.photo)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()">` : "📣"}
           <span class="nm">
             @${esc(c.channel)}
-            <small>${c.newDeals || 0} ${(c.newDeals || 0) === 1 ? "offerta trovata" : "offerte trovate"}</small>
+            <small>${LIVE.channels[c.channel]?.error ? `<span class="tag-err">errore recente</span>` : `${c.newDeals || (newByChannel[c.channel] ? 1 : 0) || 0} ${(c.newDeals || 0) === 1 ? "offerta" : "offerte"} nelle ultime 24h`}</small>
           </span>
           <a class="btn ghost small" href="https://t.me/${esc(c.channel)}" target="_blank" rel="noopener">apri</a>
+          ${extra.has(c.channel) ? `<button class="del" data-ch="${esc(c.channel)}">rimuovi</button>` : ""}
         </li>`,
         )
         .join("");
@@ -768,6 +1125,12 @@ el.channelManage.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-ch]");
   if (!b) return;
   b.disabled = true;
+  if (MODE === "static") {
+    const extra = JSON.parse(localStorage.getItem("ar_extra_channels") || "[]").filter((c) => c !== b.dataset.ch);
+    localStorage.setItem("ar_extra_channels", JSON.stringify(extra));
+    await loadChannels();
+    return;
+  }
   try {
     await api("/channels", {
       method: "POST",
@@ -782,11 +1145,23 @@ el.channelManage.addEventListener("click", async (e) => {
 });
 
 $("#addChannelBtn").addEventListener("click", async () => {
-  const name = el.newChannel.value.trim();
+  const raw = el.newChannel.value.trim();
+  const name = raw.replace(/^https?:\/\/(?:t\.me|telegram\.me)\//i, "").replace(/^@/, "").replace(/[/?#].*$/, "");
   if (!name) return;
   const btn = $("#addChannelBtn");
   btn.disabled = true;
   btn.textContent = "…";
+  if (MODE === "static") {
+    const extra = new Set(JSON.parse(localStorage.getItem("ar_extra_channels") || "[]"));
+    extra.add(name);
+    localStorage.setItem("ar_extra_channels", JSON.stringify([...extra]));
+    el.newChannel.value = "";
+    await scanNow({ manual: true });
+    await loadChannels();
+    btn.disabled = false;
+    btn.textContent = "Aggiungi";
+    return;
+  }
   try {
     await api("/channels", {
       method: "POST",
@@ -817,6 +1192,13 @@ async function init() {
   if (boot.channels.length) $("#heroChannels").textContent = boot.channels.length;
   applyMode();
 
+  if (MODE === "static") {
+    loadArchive();
+    seedLiveData();
+    state.channels = currentChannels();
+    if (state.channels.length) $("#heroChannels").textContent = state.channels.length;
+  }
+
   await Promise.all([loadStats(), loadDeals()]);
   await loadStats();
 
@@ -825,11 +1207,22 @@ async function init() {
     setInterval(loadStats, 60000); // stats fresche
   } else {
     const label = () => {
-      const when = STATIC_DATA?.generatedAt ? timeAgoIt(STATIC_DATA.generatedAt) : "";
-      setLive("ok", when ? `aggiornato ${when}` : "versione statica");
+      if (LIVE.busy) return;
+      const when = LIVE.generatedAt || STATIC_DATA?.generatedAt;
+      const ago = when ? timeAgoIt(when) : "";
+      setLive("ok", when ? `aggiornato ${ago}` : "pronto");
     };
     label();
     setInterval(label, 30000);
+    // ogni tanto ricordo quando è stato fatto l'ultimo controllo
+    setInterval(() => {
+      if (LIVE.busy || !LIVE.lastResult) return;
+      const r = LIVE.lastResult;
+      if (Date.now() - new Date(r.at).getTime() < 25000) return;
+      setLive(r.ok ? "ok" : "offline", r.ok ? `ultimo controllo ${timeAgoIt(r.at)}` : "canali non raggiungibili");
+    }, 60000);
+    renderBotStatus();
+    startAutoScan();
   }
 }
 
