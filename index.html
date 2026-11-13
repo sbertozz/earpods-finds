@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Auricolari Radar — offerte Bluetooth in tempo reale</title>
+    <meta
+      name="description"
+      content="Tutte le offerte di auricolari e cuffie Bluetooth pubblicate sui canali Telegram tech italiani, raccolte in tempo reale in un'unica web app."
+    />
+    <meta name="theme-color" content="#0b0f19" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a78bfa' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M4 14v-2a8 8 0 0 1 16 0v2'/%3E%3Crect x='2.5' y='13.5' width='4.5' height='7' rx='2.2'/%3E%3Crect x='17' y='13.5' width='4.5' height='7' rx='2.2'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+      <meta name="static-mode" content="1" />
+  </head>
+  <body>
+    <div class="bg-orbs" aria-hidden="true">
+      <span class="orb orb-1"></span>
+      <span class="orb orb-2"></span>
+      <span class="orb orb-3"></span>
+    </div>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">
+          <span class="brand-logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="2.5" y="13.5" width="4.5" height="7" rx="2.2"/><rect x="17" y="13.5" width="4.5" height="7" rx="2.2"/></svg></span>
+          <span class="brand-text">
+            <strong>Auricolari Radar</strong>
+            <small>offerte Bluetooth in tempo reale</small>
+          </span>
+        </a>
+
+        <div class="topbar-right">
+          <div class="live-pill" id="livePill" title="Aggiornamento automatico">
+            <span class="dot"></span>
+            <span id="liveText">connessione…</span>
+          </div>
+          <button class="btn ghost icon" id="soundToggle" title="Avviso sonoro per le nuove offerte" aria-label="Avviso sonoro" aria-pressed="false">
+            <svg class="ico-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/><path class="mute" d="m3 3 18 18"/></svg>
+          </button>
+          <button class="btn ghost icon" id="settingsBtn" title="Canali monitorati" aria-label="Canali monitorati"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 3a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4"/></svg></button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <!-- HERO / STATS -->
+      <section class="hero">
+        <div class="hero-copy">
+          <h1>
+            Solo <span class="grad">auricolari</span>.<br />
+            Solo offerte <span class="grad">vere</span>.
+          </h1>
+          <p class="hero-sub">
+            Pesco in tempo reale da <strong id="heroChannels">9</strong> canali Telegram tech italiani,
+            tengo solo le offerte di <strong>auricolari e cuffie Bluetooth</strong> e te le mostro qui,
+            sempre aggiornate.
+          </p>
+        </div>
+        <div class="stat-grid" id="statGrid">
+          <div class="stat"><span class="stat-value" id="statTotal">—</span><span class="stat-label">offerte attive</span></div>
+          <div class="stat"><span class="stat-value" id="stat24">—</span><span class="stat-label">ultime 24h</span></div>
+          <div class="stat"><span class="stat-value" id="statBest">—</span><span class="stat-label">sconto max</span></div>
+          <div class="stat"><span class="stat-value" id="statAvg">—</span><span class="stat-label">prezzo medio</span></div>
+        </div>
+      </section>
+
+      <!-- CONTROLS -->
+      <section class="controls">
+        <div class="search-row">
+          <div class="search-field">
+            <span class="search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+            <input
+              id="search"
+              type="search"
+              placeholder="Cerca modello o marca — es. airpods, soundcore, sony…"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button class="clear-btn" id="clearSearch" hidden aria-label="Pulisci ricerca">✕</button>
+          </div>
+          <select id="sort" class="select" aria-label="Ordinamento">
+            <option value="recent">🕒 Più recenti</option>
+            <option value="discount">🔥 Sconto maggiore</option>
+            <option value="priceAsc">💸 Prezzo più basso</option>
+            <option value="priceDesc">💎 Prezzo più alto</option>
+            <option value="popular">👀 Più viste</option>
+          </select>
+          <button class="btn ghost" id="filtersToggle" aria-expanded="false">Filtri</button>
+        </div>
+
+        <div class="filters" id="filters" hidden>
+          <div class="filter-block">
+            <span class="filter-title">Tipo</span>
+            <div class="chips" id="categoryChips"></div>
+          </div>
+          <div class="filter-block">
+            <span class="filter-title">Marca</span>
+            <div class="chips" id="brandChips"></div>
+          </div>
+          <div class="filter-block">
+            <span class="filter-title">Store</span>
+            <div class="chips" id="storeChips"></div>
+          </div>
+          <div class="filter-block range-block">
+            <label class="filter-title" for="maxPrice">Prezzo max: <output id="maxPriceOut">tutti</output></label>
+            <input id="maxPrice" type="range" min="10" max="600" step="10" value="600" />
+          </div>
+          <div class="filter-block range-block">
+            <label class="filter-title" for="minDiscount">Sconto min: <output id="minDiscountOut">0%</output></label>
+            <input id="minDiscount" type="range" min="0" max="80" step="5" value="0" />
+          </div>
+          <div class="filter-block toggles">
+            <label class="toggle"><input type="checkbox" id="only24" /> Solo ultime 24h</label>
+            <label class="toggle"><input type="checkbox" id="hideSeen" /> Nascondi già viste</label>
+            <button class="btn ghost small" id="resetFilters">Azzera filtri</button>
+          </div>
+        </div>
+
+        <div class="result-bar">
+          <span id="resultCount" class="result-count">—</span>
+          <div class="result-actions">
+            <button class="btn ghost small" id="refreshBtn">↻ Aggiorna ora</button>
+            <button class="btn ghost small" id="csvBtn">↓ CSV</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- FEED -->
+      <section class="feed-wrap">
+        <div class="feed" id="feed" aria-live="polite"></div>
+        <div class="empty" id="empty" hidden>
+          <div class="empty-emoji"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="2.5" y="13.5" width="4.5" height="7" rx="2.2"/><rect x="17" y="13.5" width="4.5" height="7" rx="2.2"/></svg></div>
+          <h3>Nessuna offerta con questi filtri</h3>
+          <p>Prova ad allargare la ricerca o azzera i filtri.</p>
+          <button class="btn" id="emptyReset">Azzera filtri</button>
+        </div>
+      </section>
+
+      <div class="load-more-wrap">
+        <button class="btn ghost" id="loadMore" hidden>Carica altre offerte</button>
+      </div>
+
+      <footer class="site-footer">
+        <div class="foot-grid">
+          <div>
+            <h4>Come funziona</h4>
+            <p>
+              La web app legge ogni 3 minuti l'anteprima pubblica (<code>t.me/s/…</code>) dei canali Telegram
+              tech italiani, estrae prezzo, sconto, link e immagine di ogni offerta e mostra solo quelle
+              che riguardano <strong>auricolari, cuffie e true wireless</strong>.
+            </p>
+          </div>
+          <div>
+            <h4>Canali monitorati</h4>
+            <ul id="channelList" class="channel-list"></ul>
+          </div>
+          <div>
+            <h4>Note</h4>
+            <p class="tiny">
+              I prezzi sono quelli indicati nei post al momento della pubblicazione: verifica sempre
+              il prezzo finale sul sito dello store. I link potrebbero essere affiliati dei canali
+              originali. Il sito Telegram di anteprima mostra solo gli ultimi messaggi: per i canali
+              privati o chiusi serve un bot amministratore (vedi README).
+            </p>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Toast -->
+    <div class="toast-stack" id="toastStack" aria-live="assertive"></div>
+
+    <!-- Floating "new deals" pill -->
+    <button class="new-pill" id="newPill" hidden>↑ <span id="newPillCount">0</span> nuove offerte — clicca per vederle</button>
+
+    <!-- Settings modal -->
+    <div class="modal-backdrop" id="modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-head">
+          <h3 id="modalTitle">Canali monitorati</h3>
+          <button class="btn ghost icon" id="modalClose" aria-label="Chiudi">✕</button>
+        </div>
+        <p class="tiny">
+          Aggiungi un canale Telegram <strong>pubblico</strong> (deve avere l'anteprima web attiva).
+          Incolla il link <code>t.me/nomecanale</code> oppure solo <code>nomecanale</code>.
+        </p>
+        <div class="add-channel">
+          <input id="newChannel" type="text" placeholder="t.me/mio_canale_offerte" />
+          <button class="btn" id="addChannelBtn">Aggiungi</button>
+        </div>
+        <ul class="channel-manage" id="channelManage"></ul>
+        <p class="tiny" id="botStatus"></p>
+      </div>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
