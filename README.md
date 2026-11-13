@@ -41,30 +41,39 @@ Nessun server, nessuna chiave API: funziona anche solo aprendo `index.html` da G
 ### 2. Aggiornamento server-side di `data.json` (la parte davvero robusta)
 
 Questa è la parte che tiene in piedi tutto: **anche se tutti i proxy CORS sono giù**, il catalogo
-resta fresco perché è GitHub a rigenerarlo. Il workflow è in
-**`.github/workflows/update-catalog.yml`** (copia di riferimento in
-`docs/github-workflow-update-catalog.yml`) e gira **ogni 12 minuti**: scarica `t.me/s/<canale>`
-direttamente lato server, rigenera `data.json` con `scripts/scan.mjs`, fa girare i test e committa.
+resta fresco perché è GitHub a rigenerarlo. Il workflow pronto è in
+**`docs/github-workflow-update-catalog.yml`**: ogni **12 minuti** scarica `t.me/s/<canale>` lato
+server, rigenera `data.json` con `scripts/scan.mjs`, fa girare i test e committa.
+
+> Perché non è già attivo: GitHub accetta file in `.github/workflows/` solo da token con permesso
+> **`workflows`**, che l'app usata da questo ambiente non ha (`refusing to allow a GitHub App to
+> create or update workflow … without workflows permission`). Il file è quindi pronto in `docs/`
+> e va installato una volta — 2 minuti, sotto.
 
 #### Attivarlo in 2 minuti
 
-1. **Controlla che il file ci sia** nel branch: `.github/workflows/update-catalog.yml`
-   (se il tuo GitHub non l'ha accettato nel push, crealo a mano con
-   **Add file → Create new file**, incollando il contenuto di `docs/github-workflow-update-catalog.yml`).
-2. **Permessi di scrittura**: *Settings → Actions → General → Workflow permissions* →
-   seleziona **Read and write permissions** → *Save*. Serve per il commit di `data.json`.
-3. **Abilita il workflow**: tab **Actions** → se compare il banner
-   *“Workflows aren't being run on this forked repository”* o *“I understand my workflows, go ahead and enable them”*,
-   clicca **Enable** / **I understand…**.
-4. **Prima esecuzione a mano**: *Actions → «Aggiorna catalogo auricolari» → Run workflow →
-   Run workflow*. In ~1 minuto vedi il job verde e `data.json` aggiornato nel repo.
-5. Fatto: da lì in poi gira da solo ogni 12 minuti. GitHub può ritardare di qualche minuto nei
-   momenti di punta (è normale, lo scheduler non è in tempo reale).
+**1. Installa il file del workflow** (una volta sola). Da terminale, sul branch che poi mergi in `main`:
 
-Senza il passaggio 2 il job fallisce in fondo con `remote: Permission to ... denied`
-(il commit di `data.json` non passa). Se non vuoi dare write al workflow, in alternativa
-puoi tenerlo in sola lettura e scaricare l'artefatto, ma per l'aggiornamento automatico
-servono i permessi di scrittura.
+```bash
+bash scripts/install-workflow.sh   # copia docs/… in .github/workflows/ e fa il commit
+git push
+```
+
+Oppure a mano da GitHub: **Add file → Create new file**, percorso
+`.github/workflows/update-catalog.yml`, incolla il contenuto di
+`docs/github-workflow-update-catalog.yml`, commit.
+
+**2. Dai i permessi di scrittura** (serve per il commit di `data.json`):
+*Settings → Actions → General → Workflow permissions* → **Read and write permissions** → *Save*.
+
+**3. Abilita e lancia la prima volta**: tab **Actions** → se compare il banner
+*“Workflows aren't being run…”* / *“I understand my workflows, go ahead and enable them”* clicca
+**Enable**; poi **«Aggiorna catalogo auricolari» → Run workflow → Run workflow**.
+
+In ~1 minuto il job è verde e `data.json` è aggiornato nel repo. Da lì in poi gira da solo.
+GitHub può ritardare di qualche minuto nei momenti di punta: è normale, lo scheduler non è in
+tempo reale. Se salti il passo 2 il job fallisce in fondo con
+`remote: Permission to … denied` (il commit non passa).
 
 #### Comandi utili
 
@@ -130,8 +139,9 @@ styles.css                 stile
 lib/tg.js                  parser Telegram + merge/dedupe/stats (browser + Node)
 lib/models.js              anagrafica ~85 modelli + specifiche + pro/contro
 scripts/scan.mjs           CLI che rigenera data.json
+scripts/install-workflow.sh  installa il workflow in .github/workflows/
 test/run.mjs               test del parser (npm-free, `node test/run.mjs`)
-.github/workflows/update-catalog.yml   aggiornamento periodico di data.json
+docs/github-workflow-update-catalog.yml  workflow da installare (aggiornamento ogni 12 min)
 data.json                  snapshot del catalogo servito dal sito
 ```
 
